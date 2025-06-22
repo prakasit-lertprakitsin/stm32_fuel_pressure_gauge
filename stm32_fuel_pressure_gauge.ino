@@ -15,22 +15,18 @@
 // Variable resistor configuration
 #define VAR_RESISTOR_PIN PA1  // Analog input pin for variable resistor
 #define MULTIPLY_MIN 1.0000   // Minimum multiply value
-#define MULTIPLY_MAX 1.2000   // Maximum multiply value
+#define MULTIPLY_MAX 1.5000   // Maximum multiply value
 
-// Calibration constants for pressure transducer
-// #define VOLTAGE_OFFSET 0.5  // Voltage at 0 PSI (adjust based on your sensor)
-// #define VOLTAGE_SCALE 0.04  // Voltage per PSI (adjust based on your sensor)
-
-#define PRESSURE_SLOPE 0.08197  // PSI per raw ADC unit
-#define PRESSURE_OFFSET 15.901  // PSI offset
-
-unsigned long zeroStartTime = 0;                                  // Time when rawValue first became 0
-bool isInZeroMode = false;                                        // Flag to track if we're in zero mock mode
-const unsigned long ZERO_TRANSITION_TIME = 30UL * 60UL * 1000UL;  // 30 minutes in milliseconds
-// const unsigned long ZERO_TRANSITION_TIME = 5UL * 60UL * 1000UL;   // 5 minutes in milliseconds
-const float INITIAL_ZERO_PRESSURE = 15.901;  // Starting pressure when rawValue = 0
-
-bool isFirstStart = true;
+/*
+rawValue => real psi
+~ 2047 => 50 psi
+~ 1628 => 44 psi
+~ 1194 => 34 psi
+~ 826 => 28 psi
+~ 688 => 25 psi
+*/
+#define PRESSURE_SLOPE 0.01855
+#define PRESSURE_OFFSET 13.9
 
 // Conversion factor: 1 PSI = 0.0689476 bar
 #define PSI_TO_BAR 0.0689476
@@ -73,6 +69,7 @@ float filteredValue = 0;
 const float alpha = 0.1;
 
 void setup() {
+  analogReadResolution(12);
   pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);        // Initialize mode button pin with internal pull-up
   pinMode(BRIGHTNESS_BUTTON_PIN, INPUT_PULLUP);  // Initialize brightness button pin with internal pull-up
   pinMode(POWER_BUTTON_PIN, INPUT_PULLUP);       // Initialize power button pin with internal pull-up
@@ -141,6 +138,9 @@ void rawValueMode() {
 }
 
 void multiplyMode() {
+  // int rawResistorValue = analogRead(VAR_RESISTOR_PIN);
+  // display.showNumberDec(rawResistorValue);
+
   float multiply = readMultiplyValue();
   float percentage = (multiply - 1.0) * 100.0;       // Convert to percentage
   int scaledValue = (int)(percentage * 100);         // Scale by 100 for 2 decimal places
@@ -150,74 +150,25 @@ void multiplyMode() {
 void pressureMode(bool isPsi) {
   int rawValue = analogRead(SENSOR_PIN);
 
-  // Exponential Moving Average (EMA)
+  // EMA filtering
   filteredValue = alpha * rawValue + (1 - alpha) * filteredValue;
 
+  // แปลง raw ADC → pressure โดยตรง
+  float pressurePSI = filteredValue * PRESSURE_SLOPE + PRESSURE_OFFSET;
+
+  // Apply multiply factor (เช่นใช้ปรับความแม่นหรือเทียบกับ sensor อื่น)
   float multiply = readMultiplyValue();
-  float pressurePSI;
+  pressurePSI *= multiply;
 
-  if (isFirstStart) {
-    if (rawValue > 2) {
-      isFirstStart = false;
-    } else {
-      filteredValue = 0;
-    }
-
-    // Handle special case when rawValue = 0
-  } else if (rawValue < 2 && !isFirstStart) {
-    if (!isInZeroMode) {
-      // First time entering zero mode
-      isInZeroMode = true;
-      zeroStartTime = millis();
-      pressurePSI = INITIAL_ZERO_PRESSURE * multiply;
-    } else {
-      // We're in zero mode - calculate gradual transition
-      unsigned long currentTime = millis();
-      unsigned long elapsedTime = currentTime - zeroStartTime;
-
-      if (elapsedTime >= ZERO_TRANSITION_TIME) {
-        // 30 minutes have passed, show 0 PSI
-        pressurePSI = 0.0;
-      } else {
-        // Calculate gradual decrease from 15.901 to 0 over 30 minutes
-        float transitionProgress = (float)elapsedTime / (float)ZERO_TRANSITION_TIME;
-        float currentBasePressure = INITIAL_ZERO_PRESSURE * (1.0 - transitionProgress);
-        pressurePSI = currentBasePressure * multiply;
-      }
-    }
-  } else {
-    // Normal operation - reset zero mode if we were in it
-    if (isInZeroMode) {
-      isInZeroMode = false;
-      zeroStartTime = 0;
-    }
-
-    // Use smooth extrapolation for values below your calibrated range
-    if (filteredValue < 172) {
-      // Extrapolate linearly backwards from your calibration
-      pressurePSI = ((filteredValue * PRESSURE_SLOPE) + PRESSURE_OFFSET) * multiply;
-
-      // Optional: Prevent negative values if desired
-      if (pressurePSI < 0) {
-        pressurePSI = 0;
-      }
-    } else {
-      // Use normal calibration for values >= 172
-      pressurePSI = ((filteredValue * PRESSURE_SLOPE) + PRESSURE_OFFSET) * multiply;
-    }
-  }
-
-  // Variable to hold the scaled value for display
+  // แสดงผล
   int scaledValue;
   if (isPsi) {
-    // Scale PSI value by 10 to show one decimal place (e.g., "123.4")
-    scaledValue = (int)(pressurePSI * 10);
-    display.showNumberDecEx(scaledValue, 0b00100000);  // Display as "xxx.x"
+    scaledValue = (int)(pressurePSI * 10);  // xxx.x
+    display.showNumberDecEx(scaledValue, 0b00100000);
   } else {
-    // Convert PSI to bar and scale by 100 to show two decimal places (e.g., "12.34")
     float pressureBar = pressurePSI * PSI_TO_BAR;
-    scaledValue = (int)(pressureBar * 100);
-    display.showNumberDecEx(scaledValue, 0b01000000);  // Display as "xx.xx"
+    scaledValue = (int)(pressureBar * 100);  // xx.xx
+    display.showNumberDecEx(scaledValue, 0b01000000);
   }
 }
 
@@ -295,10 +246,14 @@ float readMultiplyValue() {
   int rawResistorValue = analogRead(VAR_RESISTOR_PIN);
 
   // Constrain the raw value to your actual range
-  int constrainedValue = constrain(rawResistorValue, 8, 1016);
+  int constrainedValue = constrain(rawResistorValue, 36, 4065);
 
-  // Map ADC value (8-1016) to multiply range (1.0000-1.2000)
-  float targetMultiply = MULTIPLY_MIN + ((float)(constrainedValue - 8) / (float)(1016 - 8)) * (MULTIPLY_MAX - MULTIPLY_MIN);
+  // Map ADC value (36-4065) to multiply range (1.0000-1.2000)
+  float targetMultiply = MULTIPLY_MIN + ((float)(constrainedValue - 36) / (float)(4065.0 - 36.0)) * (MULTIPLY_MAX - MULTIPLY_MIN);
+
+  if (targetMultiply < 1.008) {
+    return MULTIPLY_MIN;
+  }
 
   return targetMultiply;
 }
