@@ -1,4 +1,6 @@
 #include <TM1637Display.h>
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
 
 // Define pins for TM1637 CLK and DIO
 #define CLK PB11  // STM32 pin connected to TM1637 CLK
@@ -9,24 +11,35 @@
 #define BRIGHTNESS_BUTTON_PIN PA3  // STM32 pin connected to brightness button
 #define POWER_BUTTON_PIN PA4       // STM32 pin connected to power button
 
-// Pressure sensor configuration
-#define SENSOR_PIN PA0  // Analog input pin for pressure sensor
+// I2C pins for STM32 Blue Pill (Hardware I2C1)
+// SDA = PB7 (fixed hardware pin)
+// SCL = PB6 (fixed hardware pin)
+// Connect ADS1115: VDD->3.3V, GND->GND, SDA->PB7, SCL->PB6
 
-// Variable resistor configuration
-#define VAR_RESISTOR_PIN PA1  // Analog input pin for variable resistor
-#define MULTIPLY_MIN 1.0000   // Minimum multiply value
-#define MULTIPLY_MAX 1.5000   // Maximum multiply value
+// ADS1115 ADC configuration (16-bit)
+Adafruit_ADS1115 ads;  // Create ADS1115 instance
 
-/*
-rawValue => real psi
-~ 2047 => 50 psi
-~ 1628 => 44 psi
-~ 1194 => 34 psi
-~ 826 => 28 psi
-~ 688 => 25 psi
-*/
-#define PRESSURE_SLOPE 0.01855
-#define PRESSURE_OFFSET 13.9
+// Calibration data points from actual measurements
+// millivolts => psi
+// ~ 2260 => 50 psi
+// ~ 1850 => 40 psi
+// ~ 1555 => 30 psi
+// ~ 1255 => 25 psi
+
+// Using linear interpolation between calibration points
+struct CalibrationPoint {
+  int millivolts;
+  float psi;
+};
+
+// Calibration lookup table (sorted by millivolts)
+const CalibrationPoint calibrationTable[] = {
+  {1255, 27.0},
+  {1555, 32.0},
+  {1855, 40.0},
+  {2260, 51.0}
+};
+const int calibrationPoints = sizeof(calibrationTable) / sizeof(calibrationTable[0]);
 
 // Conversion factor: 1 PSI = 0.0689476 bar
 #define PSI_TO_BAR 0.0689476
@@ -52,7 +65,7 @@ const uint8_t a = 0b01010100;      // a: Segments a, c, e
 const uint8_t empty = 0b00000000;  // Empty: No segments
 
 // Variables to track state
-int mode = 0;           // Mode: 0 = "BPES", 1 = "PPES", 2 = "WTEM"
+int mode = 0;           // Mode: 0 = "Bar", 1 = "PSI", 2 = "raw"
 int brightness = 0;     // Initial brightness level
 bool displayOn = true;  // Display power state
 
@@ -65,17 +78,30 @@ bool powerButtonPressed = false;
 unsigned long modeDisplayTime = 0;
 
 // Exponential Moving Average (EMA)
-float filteredValue = 0;
-const float alpha = 0.1;
+float filteredVoltage = 0;
+const float alpha = 0.1;  // Increased alpha for faster response (was 0.1)
 
 void setup() {
-  analogReadResolution(12);
+  // Initialize I2C communication
+  Wire.begin();
+  Wire.setClock(100000);  // Back to conservative 100kHz
+  
+  if (!ads.begin(0x48)) {
+    if (!ads.begin(0x49)) {
+      display.setSegments(new uint8_t[4]{ E, r, r, empty });
+      while(1) delay(1000);
+    }
+  }
+  
+  // Use GAIN_ONE for better range up to 4.096V (safer for 4.5V max)
+  ads.setGain(GAIN_ONE);    // +/- 4.096V, 1 bit = 0.125mV (good for 0.5-4.5V range)
+  ads.setDataRate(128);     // Faster rate for quicker response (was 16)
+  
+  delay(500);  // Longer stabilization
+  
   pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);        // Initialize mode button pin with internal pull-up
   pinMode(BRIGHTNESS_BUTTON_PIN, INPUT_PULLUP);  // Initialize brightness button pin with internal pull-up
   pinMode(POWER_BUTTON_PIN, INPUT_PULLUP);       // Initialize power button pin with internal pull-up
-
-  pinMode(SENSOR_PIN, INPUT_ANALOG);
-  pinMode(VAR_RESISTOR_PIN, INPUT_ANALOG);  // Initialize variable resistor pin
 
   resetValue();
   display.setBrightness(brightness);  // Set initial brightness level
@@ -86,7 +112,7 @@ void setup() {
 void loop() {
   // Check mode button press
   if (checkButtonPress(MODE_BUTTON_PIN)) {
-    mode = (mode + 1) % 4;  // Cycle through modes
+    mode = (mode + 1) % 3;  // Cycle through modes
     updateDisplayMode();
     modeDisplayTime = millis();  // Reset timer
   }
@@ -110,90 +136,105 @@ void loop() {
     }
   }
 
-  // Switch to selected function after 1 second
+  // Switch to selected function after 1.5 seconds
   if (millis() - modeDisplayTime > 1500 && displayOn) {
     switch (mode) {
       case 0:
-        pressureMode(false);
+        pressureMode(false);  // Bar mode
         break;
       case 1:
-        pressureMode(true);
+        pressureMode(true);   // PSI mode
         break;
       case 2:
-        rawValueMode();
-        break;
-      case 3:
-        multiplyMode();
+        rawValueMode();       // Raw voltage mode
         break;
     }
   }
 
-  delay(50);  // Debounce delay for stability
+  delay(50);  // Faster loop for quicker response (was 50ms)
 }
-
 
 void rawValueMode() {
-  int rawValue = analogRead(SENSOR_PIN);
-  display.showNumberDec(rawValue);
+  // Single reading for faster response
+  int16_t adcValue = ads.readADC_SingleEnded(0);
+  float voltage = ads.computeVolts(adcValue);
+  
+  int millivolts = (int)(voltage * 1000);
+  
+  // Display with bounds checking
+  if (millivolts < 0) millivolts = 0;
+  if (millivolts > 9999) millivolts = 9999;
+  
+  display.showNumberDec(millivolts);
 }
 
-void multiplyMode() {
-  // int rawResistorValue = analogRead(VAR_RESISTOR_PIN);
-  // display.showNumberDec(rawResistorValue);
-
-  float multiply = readMultiplyValue();
-  float percentage = (multiply - 1.0) * 100.0;       // Convert to percentage
-  int scaledValue = (int)(percentage * 100);         // Scale by 100 for 2 decimal places
-  display.showNumberDecEx(scaledValue, 0b01000000);  // Display as "x.xxx"
+// Function to convert millivolts to PSI using calibration table
+float millvoltsToPSI(int millivolts) {
+  // Handle values below minimum calibration point
+  if (millivolts <= calibrationTable[0].millivolts) {
+    // Extrapolate below minimum point or return 0
+    if (millivolts < 1000) return 0.0;  // Below reasonable sensor range
+    
+    // Linear extrapolation from first two points
+    float slope = (calibrationTable[1].psi - calibrationTable[0].psi) / 
+                  (calibrationTable[1].millivolts - calibrationTable[0].millivolts);
+    return calibrationTable[0].psi + slope * (millivolts - calibrationTable[0].millivolts);
+  }
+  
+  // Handle values above maximum calibration point
+  if (millivolts >= calibrationTable[calibrationPoints-1].millivolts) {
+    // Extrapolate above maximum point
+    int lastIdx = calibrationPoints - 1;
+    float slope = (calibrationTable[lastIdx].psi - calibrationTable[lastIdx-1].psi) / 
+                  (calibrationTable[lastIdx].millivolts - calibrationTable[lastIdx-1].millivolts);
+    float extrapolated = calibrationTable[lastIdx].psi + slope * (millivolts - calibrationTable[lastIdx].millivolts);
+    
+    // Cap at reasonable maximum (e.g., 100 PSI)
+    return (extrapolated > 100.0) ? 100.0 : extrapolated;
+  }
+  
+  // Linear interpolation between calibration points
+  for (int i = 0; i < calibrationPoints - 1; i++) {
+    if (millivolts >= calibrationTable[i].millivolts && millivolts <= calibrationTable[i+1].millivolts) {
+      float slope = (calibrationTable[i+1].psi - calibrationTable[i].psi) / 
+                    (calibrationTable[i+1].millivolts - calibrationTable[i].millivolts);
+      return calibrationTable[i].psi + slope * (millivolts - calibrationTable[i].millivolts);
+    }
+  }
+  
+  // Fallback (should not reach here)
+  return 0.0;
 }
 
 void pressureMode(bool isPsi) {
-  int rawValue = analogRead(SENSOR_PIN);
+  // Read ADC value and convert to voltage
+  int16_t adcValue = ads.readADC_SingleEnded(0);
+  float voltage = ads.computeVolts(adcValue);
 
   // EMA filtering
-  filteredValue = alpha * rawValue + (1 - alpha) * filteredValue;
+  filteredVoltage = alpha * voltage + (1 - alpha) * filteredVoltage;
+  
+  // Convert filtered voltage to millivolts for calibration lookup
+  int millivolts = (int)(filteredVoltage * 1000);
+  
+  // Use calibration table to get accurate PSI reading
+  float pressurePSI = millvoltsToPSI(millivolts);
+  
+  // Ensure pressure is within reasonable range
+  if (pressurePSI < 0) pressurePSI = 0;
+  if (pressurePSI > 100) pressurePSI = 100;
 
-  // แปลง raw ADC → pressure โดยตรง
-  float pressurePSI = filteredValue * PRESSURE_SLOPE + PRESSURE_OFFSET;
-
-  // Apply multiply factor (เช่นใช้ปรับความแม่นหรือเทียบกับ sensor อื่น)
-  float multiply = readMultiplyValue();
-  pressurePSI *= multiply;
-
-  // แสดงผล
+  // Display result
   int scaledValue;
   if (isPsi) {
-    scaledValue = (int)(pressurePSI * 10);  // xxx.x
-    display.showNumberDecEx(scaledValue, 0b00100000);
+    scaledValue = (int)(pressurePSI * 10);
+    display.showNumberDecEx(scaledValue, 0b00100000);  // "xxx.x"
   } else {
     float pressureBar = pressurePSI * PSI_TO_BAR;
-    scaledValue = (int)(pressureBar * 100);  // xx.xx
-    display.showNumberDecEx(scaledValue, 0b01000000);
+    scaledValue = (int)(pressureBar * 100);
+    display.showNumberDecEx(scaledValue, 0b01000000);  // "xx.xx"
   }
 }
-
-// void pressureMode(bool isPsi) {
-//   int rawValue = analogRead(SENSOR_PIN);
-
-//   // Exponential Moving Average (EMA)
-//   filteredValue = alpha * rawValue + (1 - alpha) * filteredValue;
-
-//   float multiply = readMultiplyValue();
-//   float pressurePSI = ((filteredValue * PRESSURE_SLOPE) + PRESSURE_OFFSET) * multiply;
-
-//   // Variable to hold the scaled value for display
-//   int scaledValue;
-//   if (isPsi) {
-//     // Scale PSI value by 10 to show one decimal place (e.g., "123.4")
-//     scaledValue = (int)(pressurePSI * 10);
-//     display.showNumberDecEx(scaledValue, 0b00100000);  // Display as "xxx.x"
-//   } else {
-//     // Convert PSI to bar and scale by 100 to show two decimal places (e.g., "12.34")
-//     float pressureBar = pressurePSI * PSI_TO_BAR;
-//     scaledValue = (int)(pressureBar * 100);
-//     display.showNumberDecEx(scaledValue, 0b01000000);  // Display as "xx.xx"
-//   }
-// }
 
 // Function to check for button press (independent tracking for each button)
 bool checkButtonPress(int buttonPin) {
@@ -235,31 +276,13 @@ void updateDisplayMode() {
       case 2:
         display.setSegments(new uint8_t[4]{ empty, r, a, W });  // Display "raw"
         break;
-      case 3:
-        display.setSegments(new uint8_t[4]{ empty, M, U, L });  // Display "MUL"
-        break;
     }
   }
-}
-
-float readMultiplyValue() {
-  int rawResistorValue = analogRead(VAR_RESISTOR_PIN);
-
-  // Constrain the raw value to your actual range
-  int constrainedValue = constrain(rawResistorValue, 36, 4065);
-
-  // Map ADC value (36-4065) to multiply range (1.0000-1.2000)
-  float targetMultiply = MULTIPLY_MIN + ((float)(constrainedValue - 36) / (float)(4065.0 - 36.0)) * (MULTIPLY_MAX - MULTIPLY_MIN);
-
-  if (targetMultiply < 1.008) {
-    return MULTIPLY_MIN;
-  }
-
-  return targetMultiply;
 }
 
 void resetValue() {
   mode = 0;
   brightness = 0;
   displayOn = true;
+  filteredVoltage = 0;  // Reset filtered voltage
 }
