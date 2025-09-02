@@ -31,36 +31,60 @@ struct CalibrationPoint {
 };
 
 const CalibrationPoint calibrationTable[] = {
-  // ช่วง 0-25 PSI (คาดคะแน - extrapolation ย้อนกลับ)
-  { 150, 0.0 },   // คาดคะแน: sensor minimum output
-  { 250, 5.0 },   // คาดคะแน: linear trend จากจุดแรก
-  { 350, 10.0 },  // คาดคะแน
-  { 425, 15.0 },  // คาดคะแน: slope เริ่มเพิ่ม
-  { 485, 20.0 },  // คาดคะแน: curve เริ่มโค้ง
+  // milli voltage => real psi
+  // Extended range 0-100 PSI
 
-  // ข้อมูลจริงที่มีอยู่
-  { 595, 25.0 },   // ข้อมูลจริง
-  { 635, 26.0 },   // ข้อมูลจริง
-  { 670, 27.0 },   // ข้อมูลจริง
-  { 850, 30.0 },   // ข้อมูลจริง
-  { 1035, 35.0 },  // ข้อมูลจริง
-  { 1200, 40.0 },  // ข้อมูลจริง
+  // Low pressure range (0-15 PSI) - extrapolated from existing data
+  { 50, 8.0 },    // Extrapolated
+  { 75, 10.0 },   // Extrapolated
+  { 95, 11.0 },   // Extrapolated
+  { 115, 12.0 },  // Original
+  { 135, 13.0 },  // Original
+  { 155, 14.0 },  // Original
+  { 175, 15.0 },  // Interpolated
 
-  // ช่วง 40-50 PSI (interpolation จากข้อมูลจริง)
-  { 1390, 45.0 },  // คาดคะแน: interpolation ระหว่าง 40-50 PSI
-  { 1580, 50.0 },  // ข้อมูลจริง
+  // Low-medium range (15-25 PSI) - interpolated
+  { 235, 17.0 },  // Interpolated
+  { 295, 19.0 },  // Interpolated
+  { 355, 21.0 },  // Interpolated
+  { 415, 23.0 },  // Interpolated
+  { 505, 24.0 },  // Interpolated
+  { 595, 25.0 },  // Original
 
-  // ช่วง 50-100 PSI (คาดคะแน - extrapolation ไปข้างหน้า)
-  { 1770, 55.0 },  // คาดคะแน: slope ลดลงเล็กน้อย
-  { 1955, 60.0 },  // คาดคะแน: curve เริ่มโค้งมากขึ้น
-  { 2135, 65.0 },  // คาดคะแน: slope ลดลงต่อเนื่อง
-  { 2310, 70.0 },  // คาดคะแน
-  { 2480, 75.0 },  // คาดคะแน: approaching saturation
-  { 2645, 80.0 },  // คาดคะแน
-  { 2805, 85.0 },  // คาดคะแน: slope ลดลงมาก
-  { 2960, 90.0 },  // คาดคะแน
-  { 3110, 95.0 },  // คาดคะแน: near saturation
-  { 3255, 100.0 }  // คาดคะแน: maximum practical range
+  // Medium range (25-30 PSI) - based on existing data
+  { 635, 26.0 },  // Original
+  { 670, 27.0 },  // Original
+  { 705, 28.0 },  // Interpolated
+  { 777, 29.0 },  // Interpolated
+  { 850, 30.0 },  // Original
+
+  // Medium-high range (30-50 PSI) - based on existing data
+  { 920, 32.0 },   // Interpolated
+  { 978, 34.0 },   // Interpolated
+  { 1035, 35.0 },  // Original
+  { 1060, 37.0 },  // Interpolated
+  { 1080, 38.0 },  // Original
+  { 1148, 39.0 },  // Interpolated
+  { 1200, 40.0 },  // Original
+  { 1245, 41.0 },  // Interpolated
+  { 1288, 42.0 },  // Interpolated
+  { 1330, 43.0 },  // Original
+  { 1380, 45.0 },  // Interpolated
+  { 1430, 47.0 },  // Interpolated
+  { 1480, 49.0 },  // Interpolated
+  { 1590, 50.0 },  // Original
+
+  // High range (50-100 PSI) - extrapolated with conservative slope
+  { 1680, 55.0 },   // Extrapolated
+  { 1780, 60.0 },   // Extrapolated
+  { 1880, 65.0 },   // Extrapolated
+  { 1980, 70.0 },   // Extrapolated
+  { 2080, 75.0 },   // Extrapolated
+  { 2180, 80.0 },   // Extrapolated
+  { 2280, 85.0 },   // Extrapolated
+  { 2380, 90.0 },   // Extrapolated
+  { 2480, 95.0 },   // Extrapolated
+  { 2580, 100.0 },  // Extrapolated
 };
 const int calibrationPoints = sizeof(calibrationTable) / sizeof(calibrationTable[0]);
 
@@ -168,35 +192,29 @@ void rawValueMode() {
 
 // Function to convert millivolts to PSI using calibration table
 float millvoltsToPSI(int millivolts) {
-  // Handle values below minimum
+  // Handle negative values
+  if (millivolts < 0) return 0.0;
+
+  // Handle values below minimum calibration point
   if (millivolts <= calibrationTable[0].millivolts) {
-    if (millivolts < 100) return 0.0;  // Below sensor range
-
-    // Conservative extrapolation
+    // Linear extrapolation from first two points
     float slope = (calibrationTable[1].psi - calibrationTable[0].psi) / (calibrationTable[1].millivolts - calibrationTable[0].millivolts);
-    slope *= 0.7;  // Reduce slope for safety
     float result = calibrationTable[0].psi + slope * (millivolts - calibrationTable[0].millivolts);
-    return (result < 0) ? 0.0 : result;
+    return (result < 0.0) ? 0.0 : result;
   }
 
-  // Handle values above maximum
+  // Handle values above maximum calibration point
   if (millivolts >= calibrationTable[calibrationPoints - 1].millivolts) {
-    if (millivolts > 4000) return 100.0;  // Hard limit
-
-    // Use last 3 points for more stable extrapolation
+    // Linear extrapolation from last two points (with limit)
     int lastIdx = calibrationPoints - 1;
-    float slope1 = (calibrationTable[lastIdx].psi - calibrationTable[lastIdx - 1].psi) / (calibrationTable[lastIdx].millivolts - calibrationTable[lastIdx - 1].millivolts);
-    float slope2 = (calibrationTable[lastIdx - 1].psi - calibrationTable[lastIdx - 2].psi) / (calibrationTable[lastIdx - 1].millivolts - calibrationTable[lastIdx - 2].millivolts);
+    float slope = (calibrationTable[lastIdx].psi - calibrationTable[lastIdx - 1].psi) / (calibrationTable[lastIdx].millivolts - calibrationTable[lastIdx - 1].millivolts);
+    float result = calibrationTable[lastIdx].psi + slope * (millivolts - calibrationTable[lastIdx].millivolts);
 
-    float avgSlope = (slope1 + slope2) / 2.0;
-    avgSlope *= 0.8;  // Conservative extrapolation
-
-    float result = calibrationTable[lastIdx].psi + avgSlope * (millivolts - calibrationTable[lastIdx].millivolts);
-
-    return (result > 100.0) ? 100.0 : result;
+    // Cap at 110 PSI for safety
+    return (result > 110.0) ? 110.0 : result;
   }
 
-  // Linear interpolation between points
+  // Linear interpolation between calibration points
   for (int i = 0; i < calibrationPoints - 1; i++) {
     if (millivolts >= calibrationTable[i].millivolts && millivolts <= calibrationTable[i + 1].millivolts) {
       float slope = (calibrationTable[i + 1].psi - calibrationTable[i].psi) / (calibrationTable[i + 1].millivolts - calibrationTable[i].millivolts);
